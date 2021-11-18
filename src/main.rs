@@ -16,10 +16,12 @@ lazy_static! {
 async fn main() -> anyhow::Result<()>{
     env_logger::init();
 
-    let listener = TcpListener::bind("0.0.0.0:8080").await?;
+    let addr = "0.0.0.0:8080";
 
-    debug!("Listener initialised");
+    let listener = TcpListener::bind(addr).await?;
 
+    info!("Listener Initialised at {}", addr);
+    
     loop {
         let (socket, _) = listener.accept().await?;
 
@@ -91,12 +93,28 @@ async fn client_interaction(
 
             if let Some(mut clients) = SESSIONS.get_mut(&session_token.unwrap()){
                 let vec = clients.value_mut();
+                 
                 id = vec.len() as u8;
-                // Notify the users who are in the session that a new user joined
-                for (_, write_half) in vec.iter() {
-                    write_half.writable().await?;
-                    write_half.try_write(&[b'J', b'o', b'i', b'n', b'e', b'd', id])?;
+                
+                if id > 3 {
+                    return Ok(());
                 }
+
+                write_half.writable().await?;
+                write_half.try_write(&[id])?;
+
+                let mut message = [b'J', b'o', b'i', b'n', 0];
+                
+                // Notify the users who are in the session that a new user joined
+                for (client_id, client_write_half) in vec.iter() {
+                    message[4] = *client_id;
+                    write_half.writable().await?;
+                    write_half.try_write(&message)?;
+                    message[4] = id;
+                    client_write_half.writable().await?;
+                    client_write_half.try_write(&message)?;
+                }
+                
                 vec.push((id, write_half));
             }
             break;
@@ -149,6 +167,11 @@ async fn client_interaction(
             if client_id == id {
                 vec.remove(i);
                 debug!("Client {} Removed", id);
+                let buffer = [b'L', b'e', b'f', b't', id];
+                for (_, write_half) in vec.iter_mut() {
+                    write_half.writable().await?;
+                    write_half.try_write(&buffer)?;
+                }
                 break;
             }
             i += 1;
