@@ -1,19 +1,26 @@
 #[macro_use] extern crate log;
 #[macro_use] extern crate lazy_static;
 
+use std::{
+    sync::{Arc, atomic::{AtomicUsize, Ordering}},
+    time::{Instant, Duration}
+};
 use tokio::{
     net::{TcpListener, TcpStream, tcp::{OwnedReadHalf, OwnedWriteHalf}},
-    io::{AsyncWriteExt, Sink}
+    io::{self, AsyncWriteExt, Sink},
+    sync::broadcast::{self, Receiver, Sender, error::RecvError}
 };
 use rand::Rng;
 use dashmap::DashMap;
 
 lazy_static! {
-    static ref SESSIONS: DashMap<u16, Vec<(u8, OwnedWriteHalf)>> = DashMap::default();
+    static ref SESSIONS: DashMap<u16, Sender<Arc<[u8]>>> = DashMap::default();
 }
 
+static CLIENTS_COUNT: AtomicUsize = AtomicUsize::new(0);
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()>{
+async fn main() -> io::Result<()>{
     env_logger::init();
 
     let addr = "0.0.0.0:8080";
@@ -21,7 +28,7 @@ async fn main() -> anyhow::Result<()>{
     let listener = TcpListener::bind(addr).await?;
 
     info!("Listener Initialised at {}", addr);
-    
+
     loop {
         let (socket, _) = listener.accept().await?;
 
@@ -40,7 +47,7 @@ async fn main() -> anyhow::Result<()>{
 async fn client_interaction(
     read_half: OwnedReadHalf, 
     write_half: OwnedWriteHalf
-) -> anyhow::Result<()> {
+) -> io::Result<()> {
     let mut id: u8 = 0;
     let mut session_token: Option<u16> = None;
 
@@ -51,7 +58,7 @@ async fn client_interaction(
 
         debug!("Readable");
 
-        let mut buffer = vec![0u8; 11];
+        let mut buffer = [0u8; 6];
 
         if let Ok(size) = read_half.try_read(&mut buffer) {
             if size < 1 {
@@ -59,8 +66,6 @@ async fn client_interaction(
                 break;
             }
         }
-
-        buffer.retain(|b| *b != 0);
 
         debug!("Readed");
 
@@ -73,8 +78,14 @@ async fn client_interaction(
                 }
                 write_half.writable().await?;
                 write_half.try_write(&token.to_be_bytes())?;
-                SESSIONS.insert(token, vec![(id, write_half)]);
+                let (sender, _) = broadcast::channel(4);
+                SESSIONS.insert(token, sender);
                 session_token = Some(token);
+                tokio::spawn(async move { 
+                    if let Err(err) = forward_notification_loop(session_token.unwrap()).await { 
+                        error!("{}", err); 
+                    }
+                });
                 debug!("New Session Created");
                 break;
             }
@@ -91,11 +102,9 @@ async fn client_interaction(
 
             session_token = Some(u16::from_be_bytes([first_byte, second_byte]));
 
-            if let Some(mut clients) = SESSIONS.get_mut(&session_token.unwrap()){
-                let vec = clients.value_mut();
-                 
-                id = vec.len() as u8;
-                
+            if let Some(sender) = SESSIONS.get(&session_token.unwrap()){
+                id = sender.receiver_count() as u8;
+
                 if id > 3 {
                     return Ok(());
                 }
@@ -103,19 +112,21 @@ async fn client_interaction(
                 write_half.writable().await?;
                 write_half.try_write(&[id])?;
 
-                let mut message = [b'J', b'o', b'i', b'n', 0];
-                
-                // Notify the users who are in the session that a new user joined
-                for (client_id, client_write_half) in vec.iter() {
-                    message[4] = *client_id;
+                let mut message = [b'J', b'o', b'i', b'n', id];
+
+                for i in 0..id {
                     write_half.writable().await?;
+                    message[4] = i;
                     write_half.try_write(&message)?;
-                    message[4] = id;
-                    client_write_half.writable().await?;
-                    client_write_half.try_write(&message)?;
                 }
-                
-                vec.push((id, write_half));
+
+                let message = Arc::new(message);
+
+                if sender.send(message).is_err() {
+                    drop(sender);
+                    SESSIONS.remove(&session_token.unwrap());
+                    return Ok(());
+                }
             }
             break;
         }
@@ -126,67 +137,100 @@ async fn client_interaction(
         None => return Ok(())
     };
 
+    info!("Clients Connected: {}", CLIENTS_COUNT.fetch_add(1, Ordering::Relaxed) + 1);
+
     debug!("Session Token {}", session_token);
 
-    let mut buffer = [0u8; 1];
+    let mut receiver = SESSIONS.get(&session_token).unwrap().subscribe();
 
-    loop {
-        if read_half.readable().await.is_err() {
-            break;
-        };
-
-        if let Ok(size) = read_half.try_read(&mut buffer) {
-            if size < 1 {
-                break;
-            }
+    tokio::spawn(async move {
+        if let Err(err) = write_half_loop(write_half, receiver, id).await {
+            error!("Write Half: {}", err);
         }
-
-        let clients = match SESSIONS.get(&session_token){
-            Some(clients) => clients,
-            None => break
-        };
-
-        for (client_id, write_half) in clients.value() {
-            if *client_id == id {
-                continue;
-            }
-
-            if write_half.writable().await.is_err() || write_half.try_write(&[buffer[0], *client_id]).is_err() {
-                break;
-            }
+    });
+    
+    tokio::spawn(async move {
+        if let Err(err) = read_half_loop(read_half, session_token, id).await {
+            error!("Read Half: {}", err);
         }
-    }
+        if let Some(sender) = SESSIONS.get(&session_token) {
+            sender.send(Arc::new([b'L', b'e', b'f', b't', id])).ok();
+        }
+    });
 
-    if let Some(mut clients) = SESSIONS.get_mut(&session_token) {
-        let mut i = 0;
+    Ok(())
+}
 
-        let vec = clients.value_mut();
+async fn read_half_loop(read_half: OwnedReadHalf, session_token: u16, id: u8) -> io::Result<()> {
 
-        while i < vec.len() {
-            let (client_id, _) = vec[i];
-            if client_id == id {
-                vec.remove(i);
-                debug!("Client {} Removed", id);
-                let buffer = [b'L', b'e', b'f', b't', id];
-                for (_, write_half) in vec.iter_mut() {
-                    write_half.writable().await?;
-                    write_half.try_write(&buffer)?;
+    while read_half.readable().await.is_ok() {
+        let mut buffer = [0u8; 1];
+
+        let size = match read_half.try_read(&mut buffer){
+            Ok(size) => size,
+            Err(err) => {
+                if err.kind() == io::ErrorKind::WouldBlock {
+                    continue;
                 }
-                break;
+                return Err(err);
             }
-            i += 1;
+        };
+
+        if size < 1 {
+            break;
         }
 
-        if vec.len() < 1 {
-            // Drop both mutable references, so that we don't cause a deadlock.
-            drop(vec);
-            drop(clients);
-            SESSIONS.remove(&session_token);
-            debug!("SESSION Closed {}", session_token);
+        let sender = SESSIONS.get(&session_token).unwrap();
+        
+        if sender.send(Arc::new([id, buffer[0]])).is_err() {
+            break;
         }
     }
 
-    debug!("Client Disconnected");
+    Ok(())
+}
+
+async fn write_half_loop(write_half: OwnedWriteHalf, mut receiver: Receiver<Arc<[u8]>>, id: u8) -> io::Result<()> {
+    loop {
+        let message = match receiver.recv().await {
+            Ok(message) => message,
+            Err(RecvError::Lagged(_)) => continue,
+            Err(RecvError::Closed) => break
+        };
+        
+        if message[0] == id {
+            continue;
+        }
+
+        write_half.writable().await?;
+        write_half.try_write(&message)?;
+    }
+
+    CLIENTS_COUNT.fetch_sub(1, Ordering::Relaxed);
+
+    Ok(())
+}
+
+/// Notifies the players that the game must proceed forward, i.e the words will go forward in the x
+/// axis
+async fn forward_notification_loop(session_token: u16) -> io::Result<()> {
+    let message = Arc::new([b'+']);
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    while let Some(sender) = SESSIONS.get(&session_token) {
+        debug!("Notifying Clients to move Forward");
+
+        if sender.send(message.clone()).is_err() {
+            drop(sender);
+            SESSIONS.remove(&session_token);
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    
+    info!("Session {} Cleared", session_token);
 
     Ok(())
 }
